@@ -247,6 +247,14 @@ if you want to switch to V1,then double-click`go-webui-v1.bat` or use `go-webui-
 
 #### Others
 
+**One-click start (recommended):**
+
+```bash
+npm start
+```
+
+Or run the WebUI directly:
+
 ```bash
 python webui.py <language(optional)>
 ```
@@ -289,6 +297,30 @@ python webui.py
 ```
 
 then open the inference webui at `1-GPT-SoVITS-TTS/1C-inference`
+
+### API (Text-to-Speech)
+
+When you run `npm start` or `python webui.py`, the **API server** (api_v2) is also started on port **9880**. You can use it for programmatic text-to-speech.
+
+- **Swagger UI (interactive docs):** Open [http://127.0.0.1:9880/docs](http://127.0.0.1:9880/docs) in your browser to see and try all endpoints.
+- **ReDoc:** [http://127.0.0.1:9880/redoc](http://127.0.0.1:9880/redoc)
+
+To run the API **only** (no WebUI):
+
+```bash
+npm run api
+```
+
+or
+
+```bash
+python api_v2.py -a 0.0.0.0 -p 9880
+```
+
+**Voice synthesis (TTS):**
+
+- **Simple API (Alibaba-style):** Use **`POST` `/v1/tts`** with body **`{"text":"你好世界","voice":"xiaofeng"}`**. Response is JSON with **`url`** (e.g. `http://host:9880/audio/<id>.wav`); fetch that URL to get the audio file. **The link expires in 10 minutes**; after that the file is deleted and the URL returns 404. Voice name is looked up in **`wav/voices.json`**. Optional: `text_lang` (default `zh`), `media_type`. Configure **`wav/voices.json`** and optionally per-voice sidecar files **`wav/<basename>.txt`** and **`wav/<basename>.lang`** (or `.json`).
+- **Full API:** Use `GET` or `POST` `/tts` with **`ref_audio_filename`** (e.g. `seed1.wav`) or **`ref_audio_path`**; required: `text`, `text_lang`, `prompt_text`, `prompt_lang`.
 
 ## V2 Release Notes
 

@@ -1,10 +1,10 @@
 """
 # WebAPI文档
 
-` python api_v2.py -a 127.0.0.1 -p 9880 -c GPT_SoVITS/configs/tts_infer.yaml `
+` python api_v2.py -a 0.0.0.0 -p 9880 -c GPT_SoVITS/configs/tts_infer.yaml `
 
 ## 执行参数:
-    `-a` - `绑定地址, 默认"127.0.0.1"`
+    `-a` - `绑定地址, 默认"0.0.0.0"（对外访问）`
     `-p` - `绑定端口, 默认9880`
     `-c` - `TTS配置文件路径, 默认"GPT_SoVITS/configs/tts_infer.yaml"`
 
@@ -99,16 +99,43 @@ RESP:
 成功: 返回"success", http code 200
 失败: 返回包含错误信息的 json, http code 400
 
+
+### 获取可用音色列表 (v1)
+
+endpoint: `/v1/voices`
+
+GET:
+```
+http://127.0.0.1:9880/v1/voices
+```
+
+RESP:
+成功: 返回 JSON，如 `{"voices": ["xiaofeng", ...]}`，为当前 wav/voices.json 中且对应 wav 文件存在的音色名称列表。可在 /v1/tts 的 voice 参数中使用。
+
 """
 
+import json
 import os
+import re
+import secrets
 import sys
 import traceback
+import uuid
 from typing import Generator, Union
 
 now_dir = os.getcwd()
 sys.path.append(now_dir)
 sys.path.append("%s/GPT_SoVITS" % (now_dir))
+
+# Fixed voice directory: reference audio files by filename (e.g. seed1.wav) are resolved under this folder.
+WAV_VOICE_DIR = "wav"
+# Voice name -> filename mapping (e.g. {"xiaofeng": "seed1.wav"}) for /v1/tts.
+VOICES_JSON = os.path.join(WAV_VOICE_DIR, "voices.json")
+# Temporary TTS output: POST /v1/tts saves audio here and returns URL; files expire after 10 min.
+TTS_AUDIO_DIR = os.path.join(now_dir, "TEMP", "tts_audio")
+TTS_AUDIO_EXPIRE_SECONDS = 10 * 60  # 10 minutes
+# Short-link: public URL uses short_id, mapping to real filename (uuid.wav).
+TTS_AUDIO_SHORT_ID_LENGTH = 10  # chars for short id (URL-safe)
 
 import argparse
 import subprocess
@@ -116,8 +143,8 @@ import wave
 import signal
 import numpy as np
 import soundfile as sf
-from fastapi import FastAPI, Response
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 import uvicorn
 from io import BytesIO
 from tools.i18n.i18n import I18nAuto
@@ -126,13 +153,18 @@ from GPT_SoVITS.TTS_infer_pack.text_segmentation_method import get_method_names 
 from pydantic import BaseModel
 import threading
 
+# In-memory short_id <-> filename for /audio/{short_id}. Cleared on restart; cleaned when file expires.
+_short_id_to_file = {}
+_file_to_short_id = {}
+_short_id_lock = threading.Lock()
+
 # print(sys.path)
 i18n = I18nAuto()
 cut_method_names = get_cut_method_names()
 
 parser = argparse.ArgumentParser(description="GPT-SoVITS api")
 parser.add_argument("-c", "--tts_config", type=str, default="GPT_SoVITS/configs/tts_infer.yaml", help="tts_infer路径")
-parser.add_argument("-a", "--bind_addr", type=str, default="127.0.0.1", help="default: 127.0.0.1")
+parser.add_argument("-a", "--bind_addr", type=str, default="0.0.0.0", help="default: 0.0.0.0 (allow external access)")
 parser.add_argument("-p", "--port", type=int, default="9880", help="default: 9880")
 args = parser.parse_args()
 config_path = args.tts_config
@@ -148,13 +180,91 @@ tts_config = TTS_Config(config_path)
 print(tts_config)
 tts_pipeline = TTS(tts_config)
 
-APP = FastAPI()
+APP = FastAPI(
+    title="GPT-SoVITS API",
+    description="Text-to-speech API for GPT-SoVITS. Synthesize speech from text with reference voice (wav/ folder or full path). Interactive docs: /docs",
+    version="1.0.0",
+)
+
+
+@APP.get("/", summary="API info", include_in_schema=False)
+async def root():
+    """Root: API name and links to docs and health."""
+    return {
+        "name": "GPT-SoVITS API",
+        "description": "Text-to-speech API for GPT-SoVITS.",
+        "docs": "/docs",
+        "redoc": "/redoc",
+        "openapi": "/openapi.json",
+        "health": "/health",
+    }
+
+
+@APP.get("/health", summary="Health check", include_in_schema=False)
+async def health():
+    """Health check for load balancers and orchestration (e.g. k8s)."""
+    return {"status": "ok"}
+
+
+import asyncio
+import time
+
+
+def _register_tts_short_id(short_id: str, filename: str):
+    """Register short_id -> filename for GET /audio/{short_id}. Thread-safe."""
+    with _short_id_lock:
+        _short_id_to_file[short_id] = filename
+        _file_to_short_id[filename] = short_id
+
+
+def _unregister_tts_file(filename: str):
+    """Remove mapping for filename (e.g. when file is deleted). Thread-safe."""
+    with _short_id_lock:
+        short_id = _file_to_short_id.pop(filename, None)
+        if short_id is not None:
+            _short_id_to_file.pop(short_id, None)
+
+
+def _generate_short_id():
+    """Return a URL-safe short id (e.g. 10 chars). Collision-resistant."""
+    return secrets.token_urlsafe(TTS_AUDIO_SHORT_ID_LENGTH)[: TTS_AUDIO_SHORT_ID_LENGTH]
+
+
+def _cleanup_expired_tts_audio():
+    """Delete TTS audio files older than TTS_AUDIO_EXPIRE_SECONDS and unregister their short_ids."""
+    if not os.path.isdir(TTS_AUDIO_DIR):
+        return
+    now = time.time()
+    for name in os.listdir(TTS_AUDIO_DIR):
+        if not re.match(r"^[0-9a-f-]+\.wav$", name):
+            continue
+        path = os.path.join(TTS_AUDIO_DIR, name)
+        try:
+            if os.path.isfile(path) and (now - os.path.getmtime(path)) > TTS_AUDIO_EXPIRE_SECONDS:
+                _unregister_tts_file(name)
+                os.remove(path)
+        except OSError:
+            pass
+
+
+async def _cleanup_tts_audio_loop():
+    """Background task: every 60s delete expired TTS audio files."""
+    while True:
+        await asyncio.sleep(60)
+        _cleanup_expired_tts_audio()
+
+
+@APP.on_event("startup")
+async def startup_event():
+    os.makedirs(TTS_AUDIO_DIR, exist_ok=True)
+    asyncio.create_task(_cleanup_tts_audio_loop())
 
 
 class TTS_Request(BaseModel):
     text: str = None
     text_lang: str = None
     ref_audio_path: str = None
+    ref_audio_filename: str = None  # e.g. "seed1.wav", resolved under wav/
     aux_ref_audio_paths: list = None
     prompt_lang: str = None
     prompt_text: str = ""
@@ -302,6 +412,158 @@ def handle_control(command: str):
         exit(0)
 
 
+def resolve_voice_name_to_filename(voice_name: str):
+    """
+    Resolve voice name (e.g. xiaofeng) to ref_audio_filename under wav/ using wav/voices.json.
+    Returns (filename, None) or (None, JSONResponse) on error.
+    """
+    if not voice_name or not voice_name.strip():
+        return None, JSONResponse(status_code=400, content={"message": "voice (voice name) is required"})
+    voices_path = os.path.join(now_dir, VOICES_JSON)
+    if not os.path.exists(voices_path):
+        example = '{"voice_name": "filename.wav"}'
+        return None, JSONResponse(
+            status_code=400,
+            content={"message": f"Voice mapping not found: {VOICES_JSON}. Add wav/voices.json with {example}."},
+        )
+    try:
+        with open(voices_path, "r", encoding="utf-8") as f:
+            voices = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        return None, JSONResponse(status_code=400, content={"message": f"Invalid or unreadable {VOICES_JSON}: {e}"})
+    if not isinstance(voices, dict):
+        return None, JSONResponse(status_code=400, content={"message": f"{VOICES_JSON} must be a JSON object (voice_name -> filename)."})
+    filename = voices.get(voice_name.strip())
+    if not filename:
+        return None, JSONResponse(
+            status_code=400,
+            content={"message": f"Voice name not found: {voice_name}. Add it to {VOICES_JSON}."},
+        )
+    filename = filename.strip()
+    normalized = os.path.normpath(filename)
+    if normalized.startswith("..") or ".." in normalized or os.path.isabs(normalized):
+        return None, JSONResponse(status_code=400, content={"message": "Voice filename must be a simple filename under wav/, no path traversal."})
+    wav_dir_abs = os.path.abspath(os.path.join(now_dir, WAV_VOICE_DIR))
+    resolved = os.path.abspath(os.path.join(now_dir, WAV_VOICE_DIR, filename))
+    try:
+        common = os.path.commonpath([resolved, wav_dir_abs])
+    except ValueError:
+        common = ""
+    if common != wav_dir_abs or not os.path.exists(resolved):
+        return None, JSONResponse(status_code=400, content={"message": f"Voice file not found under {WAV_VOICE_DIR}/: {filename}"})
+    return filename, None
+
+
+def get_available_voice_names():
+    """
+    Load wav/voices.json and return list of voice names for which the corresponding wav file exists under wav/.
+    Returns ([name, ...], None) or ([], JSONResponse) on read/parse error.
+    """
+    voices_path = os.path.join(now_dir, VOICES_JSON)
+    if not os.path.exists(voices_path):
+        return [], None
+    try:
+        with open(voices_path, "r", encoding="utf-8") as f:
+            voices = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return [], None
+    if not isinstance(voices, dict):
+        return [], None
+    wav_dir_abs = os.path.abspath(os.path.join(now_dir, WAV_VOICE_DIR))
+    result = []
+    for name, filename in voices.items():
+        if not name or not isinstance(filename, str):
+            continue
+        filename = filename.strip()
+        normalized = os.path.normpath(filename)
+        if normalized.startswith("..") or ".." in normalized or os.path.isabs(normalized):
+            continue
+        resolved = os.path.abspath(os.path.join(now_dir, WAV_VOICE_DIR, filename))
+        try:
+            common = os.path.commonpath([resolved, wav_dir_abs])
+        except ValueError:
+            continue
+        if common == wav_dir_abs and os.path.isfile(resolved):
+            result.append(name.strip())
+    return result, None
+
+
+def load_prompt_for_ref_audio(ref_audio_filename: str, default_prompt_lang: str = "zh"):
+    """
+    Load prompt_text and prompt_lang from sidecar files under wav/ for the given ref audio filename.
+    Looks for wav/<basename>.txt + wav/<basename>.lang, or wav/<basename>.json with prompt_text and prompt_lang.
+    Returns (prompt_text, prompt_lang). If no sidecar found, returns ("", default_prompt_lang).
+    """
+    base, _ = os.path.splitext(ref_audio_filename)
+    if not base:
+        return "", default_prompt_lang
+    wav_dir = os.path.join(now_dir, WAV_VOICE_DIR)
+    # Try .json first
+    json_path = os.path.join(wav_dir, base + ".json")
+    if os.path.isfile(json_path):
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                pt = data.get("prompt_text") or ""
+                pl = data.get("prompt_lang") or default_prompt_lang
+                return (pt.strip() if isinstance(pt, str) else ""), (pl.strip() if isinstance(pl, str) else default_prompt_lang)
+        except (json.JSONDecodeError, OSError):
+            pass
+    # Try .txt + .lang
+    txt_path = os.path.join(wav_dir, base + ".txt")
+    lang_path = os.path.join(wav_dir, base + ".lang")
+    prompt_text = ""
+    prompt_lang = default_prompt_lang
+    if os.path.isfile(txt_path):
+        try:
+            with open(txt_path, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+                prompt_text = raw.split("\n")[0] if raw else ""
+        except OSError:
+            pass
+    if os.path.isfile(lang_path):
+        try:
+            with open(lang_path, "r", encoding="utf-8") as f:
+                prompt_lang = f.read().strip() or default_prompt_lang
+        except OSError:
+            pass
+    return prompt_text, prompt_lang
+
+
+def resolve_ref_audio_path(req: dict):
+    """
+    If ref_audio_filename is provided (and ref_audio_path is not), resolve it under WAV_VOICE_DIR
+    and set req["ref_audio_path"]. Path traversal is forbidden. Returns JSONResponse on error, None otherwise.
+    """
+    ref_audio_path = req.get("ref_audio_path") or ""
+    ref_audio_filename = req.get("ref_audio_filename") or ""
+    if ref_audio_path:
+        return None
+    if not ref_audio_filename:
+        return None
+    # Forbid path traversal and absolute paths
+    normalized_name = os.path.normpath(ref_audio_filename)
+    if normalized_name.startswith("..") or ".." in normalized_name or os.path.isabs(normalized_name):
+        return JSONResponse(
+            status_code=400,
+            content={"message": "ref_audio_filename must be a simple filename under wav/, path traversal not allowed"},
+        )
+    wav_dir_abs = os.path.abspath(os.path.join(now_dir, WAV_VOICE_DIR))
+    resolved_path = os.path.abspath(os.path.join(now_dir, WAV_VOICE_DIR, ref_audio_filename))
+    try:
+        common = os.path.commonpath([resolved_path, wav_dir_abs])
+    except ValueError:
+        common = ""
+    if common != wav_dir_abs or not os.path.exists(resolved_path):
+        return JSONResponse(
+            status_code=400,
+            content={"message": f"ref_audio file not found or not under {WAV_VOICE_DIR}/: {ref_audio_filename}"},
+        )
+    req["ref_audio_path"] = resolved_path
+    return None
+
+
 def check_params(req: dict):
     text: str = req.get("text", "")
     text_lang: str = req.get("text_lang", "")
@@ -340,6 +602,22 @@ def check_params(req: dict):
         )
 
     return None
+
+
+def _generate_tts_bytes(req: dict):
+    """
+    Generate TTS audio bytes (non-streaming). req must already have ref_audio_path set and pass check_params.
+    Returns (audio_bytes, media_type) or raises on error.
+    """
+    req_copy = dict(req)
+    req_copy["streaming_mode"] = False
+    req_copy["return_fragment"] = False
+    req_copy["fixed_length_chunk"] = False
+    media_type = req_copy.get("media_type", "wav")
+    tts_generator = tts_pipeline.run(req_copy)
+    sr, audio_data = next(tts_generator)
+    audio_bytes = pack_audio(BytesIO(), audio_data, sr, media_type).getvalue()
+    return audio_bytes, media_type
 
 
 async def tts_handle(req: dict):
@@ -381,6 +659,11 @@ async def tts_handle(req: dict):
     return_fragment = req.get("return_fragment", False)
     media_type = req.get("media_type", "wav")
 
+    # Resolve ref_audio_filename to ref_audio_path (voice files under wav/)
+    resolve_res = resolve_ref_audio_path(req)
+    if resolve_res is not None:
+        return resolve_res
+
     check_res = check_params(req)
     if check_res is not None:
         return check_res
@@ -415,9 +698,8 @@ async def tts_handle(req: dict):
 
 
     try:
-        tts_generator = tts_pipeline.run(req)
-
         if streaming_mode:
+            tts_generator = tts_pipeline.run(req)
 
             def streaming_generator(tts_generator: Generator, media_type: str):
                 if_frist_chunk = True
@@ -428,7 +710,6 @@ async def tts_handle(req: dict):
                         if_frist_chunk = False
                     yield pack_audio(BytesIO(), chunk, sr, media_type).getvalue()
 
-            # _media_type = f"audio/{media_type}" if not (streaming_mode and media_type in ["wav", "raw"]) else f"audio/x-{media_type}"
             return StreamingResponse(
                 streaming_generator(
                     tts_generator,
@@ -438,25 +719,35 @@ async def tts_handle(req: dict):
             )
 
         else:
-            sr, audio_data = next(tts_generator)
-            audio_data = pack_audio(BytesIO(), audio_data, sr, media_type).getvalue()
-            return Response(audio_data, media_type=f"audio/{media_type}")
+            audio_bytes, media_type = _generate_tts_bytes(req)
+            filename = f"tts.{media_type}" if media_type in ("wav", "ogg", "aac") else "tts.bin"
+            return Response(
+                audio_bytes,
+                media_type=f"audio/{media_type}",
+                headers={"Content-Disposition": f'inline; filename="{filename}"'},
+            )
     except Exception as e:
         return JSONResponse(status_code=400, content={"message": "tts failed", "Exception": str(e)})
 
 
-@APP.get("/control")
+@APP.get("/control", summary="Control", include_in_schema=False)
 async def control(command: str = None):
     if command is None:
         return JSONResponse(status_code=400, content={"message": "command is required"})
     handle_control(command)
 
 
-@APP.get("/tts")
+@APP.get(
+    "/tts",
+    summary="Text to speech",
+    description="Synthesize speech from text. Use ref_audio_filename (e.g. seed1.wav) for voice files under wav/, or ref_audio_path for full path.",
+    include_in_schema=False,
+)
 async def tts_get_endpoint(
     text: str = None,
     text_lang: str = None,
     ref_audio_path: str = None,
+    ref_audio_filename: str = None,
     aux_ref_audio_paths: list = None,
     prompt_lang: str = None,
     prompt_text: str = "",
@@ -481,11 +772,12 @@ async def tts_get_endpoint(
 ):
     req = {
         "text": text,
-        "text_lang": text_lang.lower(),
+        "text_lang": text_lang.lower() if text_lang else None,
         "ref_audio_path": ref_audio_path,
+        "ref_audio_filename": ref_audio_filename,
         "aux_ref_audio_paths": aux_ref_audio_paths,
         "prompt_text": prompt_text,
-        "prompt_lang": prompt_lang.lower(),
+        "prompt_lang": prompt_lang.lower() if prompt_lang else None,
         "top_k": top_k,
         "top_p": top_p,
         "temperature": temperature,
@@ -508,13 +800,158 @@ async def tts_get_endpoint(
     return await tts_handle(req)
 
 
-@APP.post("/tts")
+@APP.post("/tts", summary="Text to speech (POST)", include_in_schema=False)
 async def tts_post_endpoint(request: TTS_Request):
     req = request.dict()
     return await tts_handle(req)
 
 
-@APP.get("/set_refer_audio")
+@APP.get(
+    "/v1/voices",
+    summary="List available voice names",
+    description="Returns all currently available voice names (from wav/voices.json) for which the reference wav file exists. Use these names in /v1/tts as the voice parameter.",
+)
+async def v1_voices_list():
+    names, _ = get_available_voice_names()
+    return JSONResponse(status_code=200, content={"voices": names})
+
+
+class V1TTSRequest(BaseModel):
+    """Simple TTS: text + voice name only. Voice name is looked up in wav/voices.json."""
+    text: str
+    voice: str  # voice name (key in wav/voices.json), not filename
+    text_lang: str = "zh"
+    media_type: str = "wav"
+
+
+async def v1_tts_handle(text: str, voice: str, text_lang: str = "zh", media_type: str = "wav", base_url: str = None):
+    """Resolve voice name, generate audio, save to file, return JSON with url. Link expires in 10 min."""
+    filename, err = resolve_voice_name_to_filename(voice)
+    if err is not None:
+        return err
+    prompt_text, prompt_lang = load_prompt_for_ref_audio(filename, default_prompt_lang=text_lang)
+    req = {
+        "text": text,
+        "text_lang": text_lang.lower(),
+        "ref_audio_filename": filename,
+        "prompt_text": prompt_text,
+        "prompt_lang": prompt_lang,
+        "media_type": media_type,
+        "streaming_mode": False,
+        "text_split_method": "cut5",
+        "batch_size": 1,
+        "batch_threshold": 0.75,
+        "split_bucket": True,
+        "speed_factor": 1.0,
+        "fragment_interval": 0.3,
+        "seed": -1,
+        "top_k": 15,
+        "top_p": 1,
+        "temperature": 1,
+        "parallel_infer": True,
+        "repetition_penalty": 1.35,
+        "sample_steps": 32,
+        "super_sampling": False,
+        "overlap_length": 2,
+        "min_chunk_length": 16,
+    }
+    resolve_res = resolve_ref_audio_path(req)
+    if resolve_res is not None:
+        return resolve_res
+    check_res = check_params(req)
+    if check_res is not None:
+        return check_res
+    try:
+        audio_bytes, media_type = _generate_tts_bytes(req)
+    except Exception as e:
+        err_msg = str(e)
+        if "prompt_text" in err_msg.lower() or "prompt" in err_msg.lower():
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "message": "TTS requires prompt_text for this model. Add wav/<basename>.txt and wav/<basename>.lang (or .json) for the voice.",
+                    "detail": err_msg,
+                },
+            )
+        return JSONResponse(status_code=400, content={"message": "tts failed", "Exception": err_msg})
+    filename = f"{uuid.uuid4().hex}.wav"
+    out_path = os.path.join(TTS_AUDIO_DIR, filename)
+    try:
+        with open(out_path, "wb") as f:
+            f.write(audio_bytes)
+    except OSError as e:
+        return JSONResponse(status_code=500, content={"message": "Failed to save audio file", "detail": str(e)})
+    short_id = _generate_short_id()
+    with _short_id_lock:
+        while short_id in _short_id_to_file:
+            short_id = _generate_short_id()
+        _short_id_to_file[short_id] = filename
+        _file_to_short_id[filename] = short_id
+    if base_url is None:
+        base_url = f"http://{host}:{port}"
+    url = f"{base_url.rstrip('/')}/audio/{short_id}"
+    return JSONResponse(
+        status_code=200,
+        content={
+            "url": url,
+            "expires_in": TTS_AUDIO_EXPIRE_SECONDS,
+            "message": "Audio available at url; link expires in 10 minutes.",
+        },
+    )
+
+
+@APP.post(
+    "/v1/tts",
+    summary="Simple TTS (text + voice name)",
+    description="Returns JSON with url to the generated audio. Client fetches audio from that url. Link expires in 10 minutes. Body: {\"text\": \"...\", \"voice\": \"xiaofeng\"}. Optional: text_lang, media_type.",
+)
+async def v1_tts_post(request: V1TTSRequest, http_request: Request):
+    base_url = str(http_request.base_url).rstrip("/")
+    return await v1_tts_handle(
+        text=request.text,
+        voice=request.voice,
+        text_lang=request.text_lang or "zh",
+        media_type=request.media_type or "wav",
+        base_url=base_url,
+    )
+
+
+# Short id: URL-safe alphanumeric (e.g. 10 chars). Not the raw filename.
+_SHORT_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{6,32}$")
+
+
+@APP.get(
+    "/audio/{file_id}",
+    summary="Get TTS audio file (short link)",
+    description="Download audio by short id returned from POST /v1/tts. URL is like /audio/a1b2c3d4e5, not the raw filename. Returns 404 if not found or expired (10 minutes).",
+)
+async def get_audio_file(file_id: str):
+    if not _SHORT_ID_PATTERN.match(file_id):
+        return JSONResponse(status_code=404, content={"message": "Not found"})
+    with _short_id_lock:
+        filename = _short_id_to_file.get(file_id)
+    if not filename:
+        return JSONResponse(status_code=404, content={"message": "File not found or expired"})
+    path = os.path.join(TTS_AUDIO_DIR, filename)
+    if not os.path.isfile(path):
+        _unregister_tts_file(filename)
+        return JSONResponse(status_code=404, content={"message": "File not found or expired"})
+    if (time.time() - os.path.getmtime(path)) > TTS_AUDIO_EXPIRE_SECONDS:
+        _unregister_tts_file(filename)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return JSONResponse(status_code=404, content={"message": "File expired"})
+    return FileResponse(
+        path,
+        media_type="audio/wav",
+        filename=filename,
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )
+
+
+@APP.get("/set_refer_audio", summary="Set default reference audio", include_in_schema=False)
 async def set_refer_aduio(refer_audio_path: str = None):
     try:
         tts_pipeline.set_ref_audio(refer_audio_path)
@@ -542,7 +979,7 @@ async def set_refer_aduio(refer_audio_path: str = None):
 #     return JSONResponse(status_code=200, content={"message": "success"})
 
 
-@APP.get("/set_gpt_weights")
+@APP.get("/set_gpt_weights", summary="Switch GPT model weights", include_in_schema=False)
 async def set_gpt_weights(weights_path: str = None):
     try:
         if weights_path in ["", None]:
@@ -554,7 +991,7 @@ async def set_gpt_weights(weights_path: str = None):
     return JSONResponse(status_code=200, content={"message": "success"})
 
 
-@APP.get("/set_sovits_weights")
+@APP.get("/set_sovits_weights", summary="Switch SoVITS model weights", include_in_schema=False)
 async def set_sovits_weights(weights_path: str = None):
     try:
         if weights_path in ["", None]:

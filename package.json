@@ -1,0 +1,10 @@
+{
+  "name": "gpt-sovits",
+  "version": "1.0.0",
+  "private": true,
+  "description": "GPT-SoVITS WebUI & API",
+  "scripts": {
+    "start": "python webui.py",
+    "api": "python api_v2.py"
+  }
+}

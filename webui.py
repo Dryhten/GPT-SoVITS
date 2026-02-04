@@ -72,6 +72,9 @@ from config import (
     GPU_INDEX,
     GPU_INFOS,
     IS_GPU,
+    api_port,
+    bert_path,
+    cnhubert_path,
     exp_root,
     infer_device,
     is_half,
@@ -206,6 +209,7 @@ p_uvr5 = None
 p_asr = None
 p_denoise = None
 p_tts_inference = None
+p_api = None
 
 
 def kill_proc_tree(pid, including_parent=True):
@@ -1916,6 +1920,17 @@ with gr.Blocks(title="GPT-SoVITS WebUI", analytics_enabled=False, js=js, css=css
                         ],
                         [tts_info, open_tts, close_tts],
                     )
+                    # If TTS inference was started at launch, show "opened" state on page load
+                    def tts_load_state():
+                        if p_tts_inference is not None:
+                            return (
+                                process_info(process_name_tts, "opened"),
+                                gr.update(visible=False),
+                                gr.update(visible=True),
+                            )
+                        return (gr.update(), gr.update(), gr.update())
+
+                    app.load(fn=tts_load_state, inputs=[], outputs=[tts_info, open_tts, close_tts])
             button1Ba_open.click(
                 open1Ba,
                 [
@@ -1971,6 +1986,26 @@ with gr.Blocks(title="GPT-SoVITS WebUI", analytics_enabled=False, js=js, css=css
 
         with gr.TabItem(i18n("2-GPT-SoVITS-变声")):
             gr.Markdown(value=i18n("施工中，请静候佳音"))
+
+    # Start API (api_v2) subprocess so /docs and /tts are available on api_port
+    if p_api is None:
+        cmd = '"%s" -s api_v2.py -a 0.0.0.0 -p %s' % (python_exec, api_port)
+        print("Starting API: %s" % cmd)
+        p_api = Popen(cmd, shell=True)
+
+    # Start TTS inference WebUI (语音合成) subprocess by default so inference tab is ready
+    if p_tts_inference is None and GPT_names and SoVITS_names:
+        os.environ["gpt_path"] = GPT_names[-1]
+        os.environ["sovits_path"] = SoVITS_names[0]
+        os.environ["cnhubert_base_path"] = cnhubert_path
+        os.environ["bert_path"] = bert_path
+        os.environ["_CUDA_VISIBLE_DEVICES"] = str(fix_gpu_number(gpus))
+        os.environ["is_half"] = str(is_half)
+        os.environ["infer_ttswebui"] = str(webui_port_infer_tts)
+        os.environ["is_share"] = str(is_share)
+        cmd_tts = '"%s" -s GPT_SoVITS/inference_webui.py "%s"' % (python_exec, language)
+        print("Starting TTS inference WebUI: %s" % cmd_tts)
+        p_tts_inference = Popen(cmd_tts, shell=True)
 
     app.queue().launch(  # concurrency_count=511, max_size=1022
         server_name="0.0.0.0",
