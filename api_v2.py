@@ -112,6 +112,10 @@ http://127.0.0.1:9880/v1/voices
 RESP:
 成功: 返回 JSON，如 `{"voices": ["xiaofeng", ...]}`，为当前 wav/voices.json 中且对应 wav 文件存在的音色名称列表。可在 /v1/tts 的 voice 参数中使用。
 
+参考音频要求（wav/ 下各音色对应的 .wav）：
+- 服务启动时会自动检查时长；**超过 10 秒** 的参考音频会被自动裁剪为前 10 秒并写回原文件，**小于 3 秒** 仅打日志（TTS 可能仍会报错）。
+- 若使用 SoVITS V3，须为每个参考音频提供提示文本：`wav/<basename>.txt` + `wav/<basename>.lang`，或 `wav/<basename>.json`（含 prompt_text、prompt_lang）。
+
 ### 流式 TTS (v1)
 
 endpoint: `/v1/tts/stream`
@@ -263,6 +267,9 @@ async def _cleanup_tts_audio_loop():
 @APP.on_event("startup")
 async def startup_event():
     os.makedirs(TTS_AUDIO_DIR, exist_ok=True)
+    # 启动时自动将 wav/voices.json 中超长参考音频裁剪为 3~10 秒（写回原文件）
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _ensure_ref_audio_durations_at_startup)
     asyncio.create_task(_cleanup_tts_audio_loop())
 
 
@@ -283,7 +290,7 @@ class TTS_Request(BaseModel):
     split_bucket: bool = True
     speed_factor: float = 1.0
     fragment_interval: float = 0.3
-    seed: int = -1
+    seed: int = 2
     media_type: str = "wav"
     streaming_mode: Union[bool, int] = False
     parallel_infer: bool = True
@@ -570,6 +577,76 @@ def resolve_ref_audio_path(req: dict):
     return None
 
 
+# TTS 要求参考音频时长为 3~10 秒（与 TTS.py _set_prompt_semantic 一致）
+REF_AUDIO_DURATION_MIN_SEC = 3.0
+REF_AUDIO_DURATION_MAX_SEC = 10.0
+
+
+def _trim_ref_audio_to_valid_duration(path: str, duration: float, voice_name: str = ""):
+    """将超长参考音频裁剪为前 REF_AUDIO_DURATION_MAX_SEC 秒并写回原文件。"""
+    data, sr = sf.read(path)
+    n_keep = int(REF_AUDIO_DURATION_MAX_SEC * sr)
+    if data.ndim == 2:
+        data_trimmed = data[:n_keep, :]
+    else:
+        data_trimmed = data[:n_keep]
+    base, ext = os.path.splitext(path)
+    tmp_path = base + ".trim_tmp" + (ext or ".wav")
+    try:
+        sf.write(tmp_path, data_trimmed, sr)
+        os.replace(tmp_path, path)
+        label = f"音色「{voice_name}」" if voice_name else os.path.basename(path)
+        print(f"[ref_audio] {label} 原时长 {duration:.2f}s > {REF_AUDIO_DURATION_MAX_SEC}s，已自动裁剪为前 {REF_AUDIO_DURATION_MAX_SEC}s")
+    except Exception as e:
+        if os.path.isfile(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        print(f"[ref_audio] 裁剪失败 {path}: {e}")
+
+
+def _ensure_ref_audio_durations_at_startup():
+    """
+    服务启动时检查 wav/voices.json 中所有参考音频时长；
+    若超过 10 秒则自动裁剪为前 10 秒并写回，小于 3 秒仅打日志。
+    """
+    voices_path = os.path.join(now_dir, VOICES_JSON)
+    if not os.path.isfile(voices_path):
+        return
+    try:
+        with open(voices_path, "r", encoding="utf-8") as f:
+            voices = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return
+    if not isinstance(voices, dict):
+        return
+    wav_dir_abs = os.path.abspath(os.path.join(now_dir, WAV_VOICE_DIR))
+    for name, filename in voices.items():
+        if not name or not isinstance(filename, str):
+            continue
+        filename = filename.strip()
+        normalized = os.path.normpath(filename)
+        if normalized.startswith("..") or ".." in normalized or os.path.isabs(normalized):
+            continue
+        resolved = os.path.abspath(os.path.join(now_dir, WAV_VOICE_DIR, filename))
+        try:
+            if os.path.commonpath([resolved, wav_dir_abs]) != wav_dir_abs or not os.path.isfile(resolved):
+                continue
+        except ValueError:
+            continue
+        try:
+            info = sf.info(resolved)
+            duration = info.duration
+        except Exception as e:
+            print(f"[ref_audio] 无法读取 {filename}: {e}")
+            continue
+        if duration > REF_AUDIO_DURATION_MAX_SEC:
+            _trim_ref_audio_to_valid_duration(resolved, duration, voice_name=name.strip())
+        elif duration < REF_AUDIO_DURATION_MIN_SEC:
+            print(f"[ref_audio] 音色「{name.strip()}」{filename} 时长为 {duration:.2f}s，小于 {REF_AUDIO_DURATION_MIN_SEC}s，TTS 可能报错，请更换或延长参考音频")
+
+
 def check_params(req: dict):
     text: str = req.get("text", "")
     text_lang: str = req.get("text_lang", "")
@@ -850,10 +927,10 @@ async def v1_tts_handle(text: str, voice: str, text_lang: str = "zh", media_type
         "split_bucket": True,
         "speed_factor": 1.0,
         "fragment_interval": 0.3,
-        "seed": -1,
-        "top_k": 15,
-        "top_p": 1,
-        "temperature": 1,
+        "seed": 2,
+        "top_k": 8,
+        "top_p": 0.9,
+        "temperature": 0.6,
         "parallel_infer": True,
         "repetition_penalty": 1.35,
         "sample_steps": 32,
@@ -963,10 +1040,10 @@ def _get_v1_stream_req(voice: str, text: str, text_lang: str = "zh", media_type:
         "split_bucket": False,
         "speed_factor": 1.0,
         "fragment_interval": 0.3,
-        "seed": -1,
-        "top_k": 15,
-        "top_p": 1,
-        "temperature": 1,
+        "seed": 2,
+        "top_k": 10,
+        "top_p": 0.9,
+        "temperature": 0.6,
         "parallel_infer": False,
         "repetition_penalty": 1.35,
         "sample_steps": 32,

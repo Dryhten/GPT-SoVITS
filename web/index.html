@@ -144,7 +144,7 @@
     <div class="row">
       <button type="button" class="btn-primary" id="btnTts">合成（返回链接）</button>
       <button type="button" class="btn-secondary" id="btnStream">流式合成并播放</button>
-      <button type="button" class="btn-secondary" id="btnStopStream" disabled>停止播放</button>
+      <button type="button" class="btn-secondary" id="btnStopStream">停止播放</button>
     </div>
     <p class="hint">合成：POST /v1/tts → 返回 URL，再通过 GET /audio/{file_id} 播放。流式：WebSocket /ws/v1/tts/stream → 按消息边界收 WAV 头与 PCM 并边收边播。</p>
 
@@ -259,7 +259,6 @@
           : (location.origin.replace(/^http/, "ws") + "/ws/v1/tts/stream");
         var ws = new WebSocket(wsUrl);
         streamWsRef = ws;
-        btnStopStream.disabled = false;
         var sampleRate = 32000;
         var audioContext = null;
         var scheduledEnd = 0;
@@ -334,14 +333,11 @@
                 var firstResp = firstResponseMs != null ? " 首次响应: " + (firstResponseMs / 1000).toFixed(2) + "s" : "";
                 setStatus("流式合成结束，播放中。" + firstResp);
                 setBusy(false);
-                btnStopStream.disabled = true;
-                streamAudioContextRef = null;
                 streamWsRef = null;
                 ws.close();
               } else if (data.event === "error") {
                 setStatus("流式合成失败: " + (data.message || "error"), true);
                 setBusy(false);
-                btnStopStream.disabled = true;
                 streamAudioContextRef = null;
                 streamWsRef = null;
                 ws.close();
@@ -349,7 +345,6 @@
             } catch (e) {
               setStatus("流式合成失败: 解析响应错误", true);
               setBusy(false);
-              btnStopStream.disabled = true;
               streamAudioContextRef = null;
               streamWsRef = null;
               ws.close();
@@ -371,15 +366,12 @@
         ws.onerror = function () {
           setStatus("流式合成失败: 连接错误", true);
           setBusy(false);
-          btnStopStream.disabled = true;
           streamAudioContextRef = null;
           streamWsRef = null;
         };
 
         ws.onclose = function () {
           setBusy(false);
-          btnStopStream.disabled = true;
-          streamAudioContextRef = null;
           streamWsRef = null;
           if (!audioContext && !startedPlaying) {
             setStatus("未收到有效音频数据或连接已关闭。", true);
@@ -388,7 +380,6 @@
       });
 
       btnStopStream.addEventListener("click", function () {
-        if (btnStopStream.disabled) return;
         if (streamAudioContextRef) {
           streamAudioContextRef.suspend().catch(function () {});
           streamAudioContextRef.close().catch(function () {});
@@ -402,7 +393,6 @@
         }
         streamWsRef = null;
         setBusy(false);
-        btnStopStream.disabled = true;
         setStatus("已停止播放。");
       });
 
