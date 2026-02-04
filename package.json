@@ -5,6 +5,7 @@
   "description": "GPT-SoVITS WebUI & API",
   "scripts": {
     "start": "python webui.py",
-    "api": "python api_v2.py"
+    "api": "python api_v2.py",
+    "dev": "python api_v2.py -a 0.0.0.0 -p 9880 -c GPT_SoVITS/configs/tts_infer.yaml"
   }
 }

@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>GPT-SoVITS TTS</title>
+  <style>
+    :root {
+      --bg: #0f0f12;
+      --surface: #1a1a20;
+      --border: #2a2a32;
+      --text: #e4e4e7;
+      --muted: #71717a;
+      --accent: #3b82f6;
+      --accent-hover: #2563eb;
+      --success: #22c55e;
+      --error: #ef4444;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 1.5rem;
+      min-height: 100vh;
+    }
+    .container {
+      max-width: 36rem;
+      margin: 0 auto;
+    }
+    h1 {
+      font-size: 1.5rem;
+      font-weight: 600;
+      margin: 0 0 1.5rem;
+    }
+    .field {
+      margin-bottom: 1rem;
+    }
+    .field label {
+      display: block;
+      font-size: 0.875rem;
+      color: var(--muted);
+      margin-bottom: 0.35rem;
+    }
+    input[type="text"],
+    select,
+    textarea {
+      width: 100%;
+      padding: 0.6rem 0.75rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 0.9375rem;
+    }
+    textarea {
+      min-height: 100px;
+      resize: vertical;
+    }
+    .row {
+      display: flex;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+      margin-top: 1rem;
+    }
+    button {
+      padding: 0.6rem 1rem;
+      border-radius: 8px;
+      font-size: 0.9375rem;
+      font-weight: 500;
+      cursor: pointer;
+      border: none;
+    }
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+    .btn-primary {
+      background: var(--accent);
+      color: white;
+    }
+    .btn-primary:hover:not(:disabled) {
+      background: var(--accent-hover);
+    }
+    .btn-secondary {
+      background: var(--surface);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    .btn-secondary:hover:not(:disabled) {
+      background: var(--border);
+    }
+    .status {
+      margin-top: 1rem;
+      padding: 0.75rem;
+      border-radius: 8px;
+      font-size: 0.875rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      min-height: 2.5rem;
+    }
+    .status.error { border-color: var(--error); color: #fca5a5; }
+    .status.success { border-color: var(--success); color: #86efac; }
+    .audio-bar {
+      margin-top: 1rem;
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+    audio {
+      flex: 1;
+      height: 36px;
+    }
+    .hint {
+      font-size: 0.8125rem;
+      color: var(--muted);
+      margin-top: 0.25rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>GPT-SoVITS TTS</h1>
+
+    <div class="field">
+      <label for="apiBase">API 地址（留空则用当前域名）</label>
+      <input type="text" id="apiBase" placeholder="例如 http://127.0.0.1:9880" />
+    </div>
+
+    <div class="field">
+      <label for="voice">音色</label>
+      <select id="voice">
+        <option value="">加载中…</option>
+      </select>
+      <p class="hint">来自 GET /v1/voices</p>
+    </div>
+
+    <div class="field">
+      <label for="text">文本</label>
+      <textarea id="text" placeholder="输入要合成的文本"></textarea>
+    </div>
+
+    <div class="row">
+      <button type="button" class="btn-primary" id="btnTts">合成（返回链接）</button>
+      <button type="button" class="btn-secondary" id="btnStream">流式合成并播放</button>
+      <button type="button" class="btn-secondary" id="btnStopStream" disabled>停止播放</button>
+    </div>
+    <p class="hint">合成：POST /v1/tts → 返回 URL，再通过 GET /audio/{file_id} 播放。流式：WebSocket /ws/v1/tts/stream → 按消息边界收 WAV 头与 PCM 并边收边播。</p>
+
+    <div class="status" id="status"></div>
+    <div class="audio-bar" id="audioBar" style="display: none;">
+      <audio id="audio" controls></audio>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      const apiBaseInput = document.getElementById("apiBase");
+      const voiceSelect = document.getElementById("voice");
+      const textArea = document.getElementById("text");
+      const btnTts = document.getElementById("btnTts");
+      const btnStream = document.getElementById("btnStream");
+      const btnStopStream = document.getElementById("btnStopStream");
+      const statusEl = document.getElementById("status");
+      var streamAudioContextRef = null;
+      var streamWsRef = null;
+      const audioBar = document.getElementById("audioBar");
+      const audioEl = document.getElementById("audio");
+
+      function base() {
+        const v = (apiBaseInput.value || "").trim();
+        return v ? v.replace(/\/$/, "") : "";
+      }
+
+      function setStatus(msg, isError) {
+        statusEl.textContent = msg;
+        statusEl.className = "status " + (isError ? "error" : "success");
+      }
+
+      function setBusy(busy) {
+        btnTts.disabled = busy;
+        btnStream.disabled = busy;
+      }
+
+      async function loadVoices() {
+        try {
+          const url = base() ? base() + "/v1/voices" : "/v1/voices";
+          const res = await fetch(url);
+          if (!res.ok) throw new Error(res.status + " " + res.statusText);
+          const data = await res.json();
+          const list = data.voices || [];
+          voiceSelect.innerHTML = "";
+          if (list.length === 0) {
+            voiceSelect.innerHTML = "<option value=\"\">无可用音色</option>";
+            return;
+          }
+          list.forEach(function (v) {
+            const opt = document.createElement("option");
+            opt.value = v;
+            opt.textContent = v;
+            voiceSelect.appendChild(opt);
+          });
+        } catch (e) {
+          voiceSelect.innerHTML = "<option value=\"\">加载失败</option>";
+          setStatus("获取音色失败: " + e.message, true);
+        }
+      }
+
+      btnTts.addEventListener("click", async function () {
+        const voice = voiceSelect.value;
+        const text = (textArea.value || "").trim();
+        if (!voice || !text) {
+          setStatus("请选择音色并输入文本", true);
+          return;
+        }
+        setBusy(true);
+        setStatus("合成中…");
+        audioBar.style.display = "none";
+        try {
+          const url = base() ? base() + "/v1/tts" : "/v1/tts";
+          const res = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text, voice, text_lang: "zh", media_type: "wav" }),
+          });
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.message || err.Exception || res.statusText);
+          }
+          const data = await res.json();
+          const audioUrl = data.url;
+          if (!audioUrl) throw new Error("未返回 url");
+          setStatus("合成成功，正在播放。链接: " + audioUrl);
+          audioEl.src = audioUrl;
+          audioBar.style.display = "flex";
+          audioEl.play().catch(function (err) {
+            setStatus("合成成功，自动播放被阻止，请点击下方播放。链接: " + audioUrl);
+          });
+        } catch (e) {
+          setStatus("合成失败: " + e.message, true);
+        } finally {
+          setBusy(false);
+        }
+      });
+
+      btnStream.addEventListener("click", function () {
+        const voice = voiceSelect.value;
+        const text = (textArea.value || "").trim();
+        if (!voice || !text) {
+          setStatus("请选择音色并输入文本", true);
+          return;
+        }
+        setBusy(true);
+        setStatus("流式合成中…");
+        audioBar.style.display = "none";
+        var wsUrl = base()
+          ? base().replace(/^http/, "ws") + "/ws/v1/tts/stream"
+          : (location.origin.replace(/^http/, "ws") + "/ws/v1/tts/stream");
+        var ws = new WebSocket(wsUrl);
+        streamWsRef = ws;
+        btnStopStream.disabled = false;
+        var sampleRate = 32000;
+        var audioContext = null;
+        var scheduledEnd = 0;
+        var firstBinaryInRound = true;
+        var startedPlaying = false;
+        var pendingBuffers = [];
+        var streamStartTime = 0;
+        var firstResponseMs = null;
+
+        function drainBufferQueue() {
+          while (pendingBuffers.length > 0) {
+            var buf = pendingBuffers.shift();
+            processBuffer(buf);
+          }
+        }
+
+        function schedulePcm(pcm, sr) {
+          if (!audioContext || pcm.length === 0) return;
+          var duration = pcm.length / sr;
+          var buffer = audioContext.createBuffer(1, pcm.length, sr);
+          var channel = buffer.getChannelData(0);
+          for (var i = 0; i < pcm.length; i++) channel[i] = pcm[i] / 32768;
+          var source = audioContext.createBufferSource();
+          source.buffer = buffer;
+          source.connect(audioContext.destination);
+          source.start(scheduledEnd);
+          scheduledEnd += duration;
+          if (!startedPlaying) {
+            startedPlaying = true;
+            var firstResp = firstResponseMs != null ? "，首次响应: " + (firstResponseMs / 1000).toFixed(2) + "s" : "";
+            setStatus("正在播放（边收边播）…" + firstResp);
+          }
+        }
+
+        function processBuffer(buf) {
+          if (!buf || buf.byteLength === 0) return;
+          if (firstBinaryInRound) {
+            firstBinaryInRound = false;
+            firstResponseMs = Date.now() - streamStartTime;
+            var view = new DataView(buf, 0, Math.min(buf.byteLength, 44));
+            if (view.byteLength >= 44 && view.getUint32(0, true) === 0x46464952) {
+              sampleRate = view.getUint32(24, true);
+            }
+            audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: sampleRate });
+            streamAudioContextRef = audioContext;
+            scheduledEnd = audioContext.currentTime;
+            if (buf.byteLength > 44) {
+              var n = Math.floor((buf.byteLength - 44) / 2);
+              if (n > 0) {
+                var pcmFirst = new Int16Array(buf, 44, n);
+                schedulePcm(pcmFirst, sampleRate);
+              }
+            }
+            return;
+          }
+          var n = Math.floor(buf.byteLength / 2);
+          if (n === 0) return;
+          var pcm = new Int16Array(buf, 0, n);
+          schedulePcm(pcm, sampleRate);
+        }
+
+        ws.onopen = function () {
+          streamStartTime = Date.now();
+          ws.send(JSON.stringify({ text: text, voice: voice, text_lang: "zh", media_type: "wav" }));
+        };
+
+        ws.onmessage = function (ev) {
+          if (typeof ev.data === "string") {
+            try {
+              var data = JSON.parse(ev.data);
+              if (data.event === "SynthesisCompleted") {
+                var firstResp = firstResponseMs != null ? " 首次响应: " + (firstResponseMs / 1000).toFixed(2) + "s" : "";
+                setStatus("流式合成结束，播放中。" + firstResp);
+                setBusy(false);
+                btnStopStream.disabled = true;
+                streamAudioContextRef = null;
+                streamWsRef = null;
+                ws.close();
+              } else if (data.event === "error") {
+                setStatus("流式合成失败: " + (data.message || "error"), true);
+                setBusy(false);
+                btnStopStream.disabled = true;
+                streamAudioContextRef = null;
+                streamWsRef = null;
+                ws.close();
+              }
+            } catch (e) {
+              setStatus("流式合成失败: 解析响应错误", true);
+              setBusy(false);
+              btnStopStream.disabled = true;
+              streamAudioContextRef = null;
+              streamWsRef = null;
+              ws.close();
+            }
+            return;
+          }
+          var buf = ev.data;
+          if (buf instanceof Blob) {
+            buf.arrayBuffer().then(function (arrayBuffer) {
+              pendingBuffers.push(arrayBuffer);
+              drainBufferQueue();
+            });
+          } else {
+            pendingBuffers.push(buf instanceof ArrayBuffer ? buf : buf.buffer);
+            drainBufferQueue();
+          }
+        };
+
+        ws.onerror = function () {
+          setStatus("流式合成失败: 连接错误", true);
+          setBusy(false);
+          btnStopStream.disabled = true;
+          streamAudioContextRef = null;
+          streamWsRef = null;
+        };
+
+        ws.onclose = function () {
+          setBusy(false);
+          btnStopStream.disabled = true;
+          streamAudioContextRef = null;
+          streamWsRef = null;
+          if (!audioContext && !startedPlaying) {
+            setStatus("未收到有效音频数据或连接已关闭。", true);
+          }
+        };
+      });
+
+      btnStopStream.addEventListener("click", function () {
+        if (btnStopStream.disabled) return;
+        if (streamAudioContextRef) {
+          streamAudioContextRef.suspend().catch(function () {});
+          streamAudioContextRef.close().catch(function () {});
+          streamAudioContextRef = null;
+        }
+        if (streamWsRef && streamWsRef.readyState === WebSocket.OPEN) {
+          try {
+            streamWsRef.send(JSON.stringify({ event: "stop" }));
+          } catch (e) {}
+          streamWsRef.close();
+        }
+        streamWsRef = null;
+        setBusy(false);
+        btnStopStream.disabled = true;
+        setStatus("已停止播放。");
+      });
+
+      loadVoices();
+    })();
+  </script>
+</body>
+</html>

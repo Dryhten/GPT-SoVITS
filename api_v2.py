@@ -112,6 +112,18 @@ http://127.0.0.1:9880/v1/voices
 RESP:
 成功: 返回 JSON，如 `{"voices": ["xiaofeng", ...]}`，为当前 wav/voices.json 中且对应 wav 文件存在的音色名称列表。可在 /v1/tts 的 voice 参数中使用。
 
+### 流式 TTS (v1)
+
+endpoint: `/v1/tts/stream`
+
+POST: Body 与 POST /v1/tts 相同，如 `{"text": "...", "voice": "xiaofeng"}`，可选 `text_lang`、`media_type`。
+成功: 直接返回 audio/wav 流（首包为 WAV 头，后续为 PCM 数据块），适合长文本以降低首包延迟。
+
+### 网页端
+
+启动 api_v2 后，在浏览器访问根路径即可使用简单网页：GET `/` 返回 `web/index.html`。
+网页提供：音色列表（GET /v1/voices）、合成并播放（POST /v1/tts + GET /audio/{file_id}）、流式合成并播放（POST /v1/tts/stream）。
+
 """
 
 import json
@@ -143,8 +155,9 @@ import wave
 import signal
 import numpy as np
 import soundfile as sf
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, WebSocket
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 import uvicorn
 from io import BytesIO
 from tools.i18n.i18n import I18nAuto
@@ -187,23 +200,16 @@ APP = FastAPI(
 )
 
 
-@APP.get("/", summary="API info", include_in_schema=False)
-async def root():
-    """Root: API name and links to docs and health."""
-    return {
-        "name": "GPT-SoVITS API",
-        "description": "Text-to-speech API for GPT-SoVITS.",
-        "docs": "/docs",
-        "redoc": "/redoc",
-        "openapi": "/openapi.json",
-        "health": "/health",
-    }
-
-
 @APP.get("/health", summary="Health check", include_in_schema=False)
 async def health():
     """Health check for load balancers and orchestration (e.g. k8s)."""
     return {"status": "ok"}
+
+
+@APP.get("/favicon.ico", summary="Favicon", include_in_schema=False)
+async def favicon():
+    """Return 204 No Content so browsers do not repeatedly request favicon and get 404."""
+    return Response(status_code=204, headers={"Cache-Control": "public, max-age=86400"})
 
 
 import asyncio
@@ -916,6 +922,172 @@ async def v1_tts_post(request: V1TTSRequest, http_request: Request):
     )
 
 
+def _v1_streaming_generator(tts_generator: Generator, media_type: str):
+    """Yield WAV header then raw PCM chunks for streaming response."""
+    if_frist_chunk = True
+    for sr, chunk in tts_generator:
+        if if_frist_chunk and media_type == "wav":
+            yield wave_header_chunk(sample_rate=sr)
+            media_type = "raw"
+            if_frist_chunk = False
+        yield pack_audio(BytesIO(), chunk, sr, media_type).getvalue()
+
+
+def _get_v1_stream_req(voice: str, text: str, text_lang: str = "zh", media_type: str = "wav"):
+    """
+    Build and validate req for v1 stream TTS. Shared by HTTP stream and WebSocket.
+    Returns (req, None) on success, or (None, error_message_str) on error.
+    """
+    filename, err = resolve_voice_name_to_filename(voice)
+    if err is not None:
+        try:
+            body = err.body
+            msg = json.loads(body.decode("utf-8")).get("message", "invalid voice")
+        except Exception:
+            msg = "invalid voice"
+        return None, msg
+    prompt_text, prompt_lang = load_prompt_for_ref_audio(filename, default_prompt_lang=text_lang)
+    req = {
+        "text": text,
+        "text_lang": text_lang.lower(),
+        "ref_audio_filename": filename,
+        "prompt_text": prompt_text,
+        "prompt_lang": prompt_lang,
+        "media_type": media_type,
+        "streaming_mode": 2,
+        "return_fragment": False,
+        "fixed_length_chunk": False,
+        "text_split_method": "cut5",
+        "batch_size": 1,
+        "batch_threshold": 0.75,
+        "split_bucket": False,
+        "speed_factor": 1.0,
+        "fragment_interval": 0.3,
+        "seed": -1,
+        "top_k": 15,
+        "top_p": 1,
+        "temperature": 1,
+        "parallel_infer": False,
+        "repetition_penalty": 1.35,
+        "sample_steps": 32,
+        "super_sampling": False,
+        "overlap_length": 2,
+        "min_chunk_length": 16,
+    }
+    resolve_res = resolve_ref_audio_path(req)
+    if resolve_res is not None:
+        try:
+            msg = json.loads(resolve_res.body.decode("utf-8")).get("message", "ref_audio error")
+        except Exception:
+            msg = "ref_audio error"
+        return None, msg
+    check_res = check_params(req)
+    if check_res is not None:
+        try:
+            msg = json.loads(check_res.body.decode("utf-8")).get("message", "params error")
+        except Exception:
+            msg = "params error"
+        return None, msg
+    return req, None
+
+
+async def v1_tts_stream_handle(text: str, voice: str, text_lang: str = "zh", media_type: str = "wav"):
+    """Stream TTS audio chunk by chunk. Uses existing streaming_mode=2 (semantic chunk streaming)."""
+    req, err_msg = _get_v1_stream_req(voice, text, text_lang, media_type)
+    if err_msg is not None:
+        return JSONResponse(status_code=400, content={"message": err_msg})
+    try:
+        tts_generator = tts_pipeline.run(req)
+        return StreamingResponse(
+            _v1_streaming_generator(tts_generator, req["media_type"]),
+            media_type=f"audio/{req['media_type']}",
+        )
+    except Exception as e:
+        err_msg = str(e)
+        if "prompt_text" in err_msg.lower() or "prompt" in err_msg.lower():
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "message": "TTS requires prompt_text for this model. Add wav/<basename>.txt and wav/<basename>.lang (or .json) for the voice.",
+                    "detail": err_msg,
+                },
+            )
+        return JSONResponse(status_code=400, content={"message": "tts failed", "Exception": err_msg})
+
+
+@APP.post(
+    "/v1/tts/stream",
+    summary="Stream TTS (text + voice name)",
+    description="Stream audio chunk by chunk. Same body as POST /v1/tts (text, voice). Optional: text_lang, media_type. Returns audio/wav stream (first chunk is WAV header, then raw PCM). Use for long text to get lower first-byte latency.",
+)
+async def v1_tts_stream_post(request: V1TTSRequest):
+    return await v1_tts_stream_handle(
+        text=request.text,
+        voice=request.voice,
+        text_lang=request.text_lang or "zh",
+        media_type=request.media_type or "wav",
+    )
+
+
+@APP.websocket("/ws/v1/tts/stream")
+async def ws_v1_tts_stream(websocket: WebSocket):
+    """
+    WebSocket stream TTS. One connection supports multiple syntheses in sequence.
+    Send JSON: {"text": "...", "voice": "...", "text_lang": "zh"} to start synthesis.
+    Server sends: binary frames (first = 44-byte WAV header, then PCM chunks), then {"event": "SynthesisCompleted"}.
+    Send {"event": "close"} or close connection to end. On error, server sends {"event": "error", "message": "..."}.
+    """
+    await websocket.accept()
+    try:
+        while True:
+            try:
+                raw = await websocket.receive_text()
+            except Exception:
+                break
+            try:
+                data = json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                await websocket.send_text(json.dumps({"event": "error", "message": "invalid JSON"}))
+                continue
+            if data.get("event") == "close":
+                break
+            text = data.get("text") or ""
+            voice = (data.get("voice") or "").strip()
+            text_lang = data.get("text_lang") or "zh"
+            media_type = data.get("media_type") or "wav"
+            req, err_msg = _get_v1_stream_req(voice, text, text_lang, media_type)
+            if err_msg is not None:
+                await websocket.send_text(json.dumps({"event": "error", "message": err_msg}))
+                continue
+            try:
+                tts_generator = tts_pipeline.run(req)
+                media_type = req["media_type"]
+                cancelled = False
+                for chunk in _v1_streaming_generator(tts_generator, media_type):
+                    await websocket.send_bytes(chunk)
+                    try:
+                        msg = await asyncio.wait_for(websocket.receive_text(), timeout=0.02)
+                        data = json.loads(msg) if msg else {}
+                        if data.get("event") in ("stop", "close"):
+                            cancelled = True
+                            break
+                    except asyncio.TimeoutError:
+                        pass
+                    except (json.JSONDecodeError, Exception):
+                        pass
+                if not cancelled:
+                    await websocket.send_text(json.dumps({"event": "SynthesisCompleted"}))
+            except Exception as e:
+                err_msg = str(e)
+                await websocket.send_text(json.dumps({"event": "error", "message": err_msg}))
+    except Exception:
+        pass
+    try:
+        await websocket.close()
+    except Exception:
+        pass
+
+
 # Short id: URL-safe alphanumeric (e.g. 10 chars). Not the raw filename.
 _SHORT_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{6,32}$")
 
@@ -1000,6 +1172,12 @@ async def set_sovits_weights(weights_path: str = None):
     except Exception as e:
         return JSONResponse(status_code=400, content={"message": "change sovits weight failed", "Exception": str(e)})
     return JSONResponse(status_code=200, content={"message": "success"})
+
+
+# 网页端：挂载 web 目录，GET / 返回 index.html，API 路由优先
+_web_dir = os.path.join(now_dir, "web")
+if os.path.isdir(_web_dir):
+    APP.mount("/", StaticFiles(directory=_web_dir, html=True), name="web")
 
 
 if __name__ == "__main__":
